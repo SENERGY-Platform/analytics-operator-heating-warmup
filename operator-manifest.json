@@ -1,0 +1,132 @@
+{
+  "inputs": [
+    {
+      "name": "room_temperature",
+      "type": "float"
+    },
+    {
+      "name": "target_temperature",
+      "type": "float"
+    },
+    {
+      "name": "outdoor_temperature",
+      "type": "float"
+    },
+    {
+      "name": "forecast_temperature",
+      "type": "string"
+    },
+    {
+      "name": "forecasted_for",
+      "type": "string"
+    },
+    {
+      "name": "outdoor_station_name",
+      "type": "string"
+    },
+    {
+      "name": "outdoor_station_lat",
+      "type": "float"
+    },
+    {
+      "name": "outdoor_station_long",
+      "type": "float"
+    },
+    {
+      "name": "forecast_station_name",
+      "type": "string"
+    },
+    {
+      "name": "forecast_station_lat",
+      "type": "float"
+    },
+    {
+      "name": "forecast_station_long",
+      "type": "float"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "zone",
+      "type": "string"
+    },
+    {
+      "name": "zone_name",
+      "type": "string"
+    },
+    {
+      "name": "a",
+      "type": "float"
+    },
+    {
+      "name": "b",
+      "type": "float"
+    },
+    {
+      "name": "episodes",
+      "type": "int"
+    },
+    {
+      "name": "warmup_minutes",
+      "type": "int"
+    },
+    {
+      "name": "next_start",
+      "type": "string"
+    },
+    {
+      "name": "next_target",
+      "type": "float"
+    },
+    {
+      "name": "next_lead_minutes",
+      "type": "int"
+    },
+    {
+      "name": "windows",
+      "type": "string"
+    },
+    {
+      "name": "measure_station",
+      "type": "string"
+    },
+    {
+      "name": "forecast_station",
+      "type": "string"
+    }
+  ],
+  "config_values": [
+    {
+      "name": "logger_level",
+      "type": "string"
+    },
+    {
+      "name": "lat",
+      "type": "float"
+    },
+    {
+      "name": "long",
+      "type": "float"
+    },
+    {
+      "name": "measure_station",
+      "type": "string"
+    },
+    {
+      "name": "forecast_station",
+      "type": "string"
+    },
+    {
+      "name": "zones",
+      "type": "string"
+    },
+    {
+      "name": "history_days",
+      "type": "float"
+    },
+    {
+      "name": "max_lead_minutes",
+      "type": "int"
+    }
+  ]
+}
