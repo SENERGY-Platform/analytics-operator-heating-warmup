@@ -19,7 +19,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "==1.26.4" },
-    { name = "operator-lib", git = "https://github.com/SENERGY-Platform/analytics-operator-lib-python?rev=v1.15.0" },
+    { name = "operator-lib", git = "https://github.com/SENERGY-Platform/analytics-operator-lib-python?rev=v1.15.1" },
     { name = "pandas", specifier = "<2" },
 ]
 
@@ -534,8 +534,8 @@ wheels = [
 
 [[package]]
 name = "operator-lib"
-version = "1.15.0"
-source = { git = "https://github.com/SENERGY-Platform/analytics-operator-lib-python?rev=v1.15.0#2ab8ca86c893296dab8b6c9b706464f284f52446" }
+version = "1.15.1"
+source = { git = "https://github.com/SENERGY-Platform/analytics-operator-lib-python?rev=v1.15.1#c4f82d250b68081e01c7ae07f1fd36f76bde3804" }
 dependencies = [
     { name = "concurrency-watchdog" },
     { name = "confluent-kafka" },

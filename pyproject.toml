@@ -4,7 +4,7 @@ name = "analytics-operator-heating-warmup"
 version = "0.0.0"
 requires-python = "==3.10.*"
 dependencies = [
-    "operator-lib @ git+https://github.com/SENERGY-Platform/analytics-operator-lib-python@v1.15.0",
+    "operator-lib @ git+https://github.com/SENERGY-Platform/analytics-operator-lib-python@v1.15.1",
     "pandas<2",
     "numpy==1.26.4",
 ]
