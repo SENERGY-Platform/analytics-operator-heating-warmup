@@ -53,14 +53,14 @@ def simulate(a: float, b: float, days: int, outdoor: typing.Callable[[int], floa
                 report_minutes=report_minutes, decimals=decimals, seed=seed, device=device, dead_minutes=dead_minutes)
 
 
-def simulate_curve(k: float, c: float, slope: float, room: float, days: int, outdoor: typing.Callable[[int], float],
+def simulate_curve(k: float, c: float, curve, days: int, outdoor: typing.Callable[[int], float],
                    dead_minutes=0, **kwargs):
     """
     As simulate(), with a radiator fed along the heating curve: dT/dt = k (flow - T) - c (T - T_out) while heating,
-    flow = room + slope (room - T_out), and -c (T - T_out) with the valve closed.
+    flow = curve.flow(T_out), and -c (T - T_out) with the valve closed.
     """
     def heating(out):
-        flow = room + slope * (room - out)
+        flow = curve.flow(out)
         return (k * flow + c * out) / (k + c), k + c
 
     return _run(heating=heating, cooling=lambda out: (out, c), days=days, outdoor=outdoor, dead_minutes=dead_minutes,

@@ -232,7 +232,9 @@ def fit_episodes(grid: Grid, episodes: typing.List[typing.Tuple[int, int]], dead
             k, c = float(coef[0]), 0.0
         if k <= 0:
             return None, f"rejected, k={k:.4f} 1/h"
-        a0, a1, b = k * curve.room * (1 + curve.slope), -k * (1 + curve.slope), k + c
+        # k (flow(T_out) - T_out) is a(T_out), linear because the flow is.
+        flow0 = float(curve.flow(0.0))
+        a0, a1, b = k * flow0, k * (float(curve.flow(1.0)) - flow0 - 1.0), k + c
         ta_min = ta_max = None
     else:
         k = c = None

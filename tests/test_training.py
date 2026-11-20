@@ -174,11 +174,12 @@ class TestFit(unittest.TestCase):
 
 
 class TestDeadTimeAndHeatingPower(unittest.TestCase):
-    CURVE = HeatingCurve(0.8, 22.0)
+    # The line of slope 0.8 at room 22: flow = 22 + 0.8 (22 - T_out).
+    CURVE = HeatingCurve(47.6, 31.6)
 
     def test_the_heating_curve_gives_back_k_c_and_the_dead_time(self):
         k, c = 0.12, 0.06
-        thermostat, weather = simulate_curve(k, c, 0.8, 22.0, days=14, outdoor=outdoor_by_day, dead_minutes=30)
+        thermostat, weather = simulate_curve(k, c, self.CURVE, days=14, outdoor=outdoor_by_day, dead_minutes=30)
         model, notes, _, episodes = fit([FakeDataset(thermostat), FakeDataset(weather)], curve=self.CURVE)
         self.assertEqual((model.dead_minutes, episodes), (30, 14))
         # a1 = -k (1 + s), b = k + c
@@ -231,7 +232,7 @@ class TestDeadTimeAndHeatingPower(unittest.TestCase):
         g = exact_episodes([(k * r * (1 + s), k + c, out, 17.0, 6) for out in (-2.0, 4.0, 9.0)], a1=-k * (1 + s))
         episodes = find_episodes(g)
         self.assertEqual(len(episodes), 3)
-        found, _ = fit_episodes(g, episodes, 0, HeatingCurve(s, r))
+        found, _ = fit_episodes(g, episodes, 0, HeatingCurve(r + s * (r + 10), r + s * (r - 10)))
         self.assertEqual(found.c, 0.0)
         # k alone by least squares, and the model it converts to.
         index = np.array([i for first, last in episodes for i in range(first, last)])
@@ -239,7 +240,8 @@ class TestDeadTimeAndHeatingPower(unittest.TestCase):
         room = (g.room[index] + g.room[index + 1]) / 2
         heat = r + s * (r - g.outdoor[index]) - room
         self.assertAlmostEqual(found.k, float(heat @ y / (heat @ heat)), places=12)
-        self.assertEqual((found.a1, found.b), (-found.k * (1 + s), found.k))
+        self.assertAlmostEqual(found.a1, -found.k * (1 + s), places=12)
+        self.assertEqual(found.b, found.k)
 
     def test_a1_is_zero_below_three_kelvin_of_outdoor_spread(self):
         for days, a1 in (((2.0, 4.9), 0.0), ((2.0, 5.0), None)):

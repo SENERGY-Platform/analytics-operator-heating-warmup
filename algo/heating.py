@@ -50,24 +50,27 @@ def _finite(value, name: str) -> float:
 
 @dataclasses.dataclass(frozen=True)
 class HeatingCurve:
-    """Weather-compensated flow temperature of the boiler, linear: R + s (R - T_out)."""
-    slope: float  # s
-    room: float  # R, the room temperature the heating circuit is set to, °C
+    """
+    Weather-compensated flow temperature of the boiler as the line through its values at -10 and +10 °C outdoors.
+    Two points describe the curve of any make, and a curved one stays within about 1 K of the line between them.
+    """
+    cold: float  # flow at -10 °C, °C
+    mild: float  # flow at +10 °C, °C
 
     def flow(self, outdoor):
-        return self.room + self.slope * (self.room - outdoor)
+        return self.mild + (self.cold - self.mild) * (10.0 - outdoor) / 20.0
 
 
-def parse_heating_curve(slope, room) -> typing.Optional[HeatingCurve]:
+def parse_heating_curve(cold, mild) -> typing.Optional[HeatingCurve]:
     """None when neither is set. One without the other or an invalid value raises ValueError."""
-    if _blank(slope) and _blank(room):
+    if _blank(cold) and _blank(mild):
         return None
-    if _blank(slope) or _blank(room):
-        raise ValueError("heating_curve and heating_curve_room are set together or not at all")
-    s = _finite(slope, "heating_curve")
-    if s <= 0:
-        raise ValueError(f"heating_curve must be positive, got {slope!r}")
-    return HeatingCurve(s, _finite(room, "heating_curve_room"))
+    if _blank(cold) or _blank(mild):
+        raise ValueError("flow_at_minus10 and flow_at_plus10 are set together or not at all")
+    c, m = _finite(cold, "flow_at_minus10"), _finite(mild, "flow_at_plus10")
+    if c < m:
+        raise ValueError(f"flow_at_minus10 must not be below flow_at_plus10, got {cold!r} and {mild!r}")
+    return HeatingCurve(c, m)
 
 
 def _ns(at: datetime.datetime) -> int:

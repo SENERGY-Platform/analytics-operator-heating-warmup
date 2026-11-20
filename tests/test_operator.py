@@ -694,7 +694,7 @@ class TestRetraining(unittest.TestCase):
     def test_heating_curve_and_switch_off_reach_the_training(self):
         thermostat, weather = simulate(4.0, 0.15, days=5, outdoor=outdoor_by_day)
         history = [FakeDataset(thermostat), FakeDataset(weather)]
-        op = self.operator(heating_curve="0.8", heating_curve_room="22")
+        op = self.operator(flow_at_minus10="47.6", flow_at_plus10="31.6")
         model, _ = self.train(op, history=history)
         self.assertEqual((model.get("z").ta_min, model.get("z").ta_max), (None, None))
         # The heating comes on at 06:00 UTC, 07:00 in Berlin. Switched off then, no warm-up is usable.
@@ -730,8 +730,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((main.heating_curve(config), main.off_window(config)), (None, None))
 
     def test_heating_curve_and_switch_off(self):
-        config = CustomConfig({"heating_curve": "0.8", "heating_curve_room": "22", "heating_off": "23:30-03:00"})
-        self.assertEqual(main.heating_curve(config), HeatingCurve(0.8, 22.0))
+        config = CustomConfig({"flow_at_minus10": "47.6", "flow_at_plus10": "31.6", "heating_off": "23:30-03:00"})
+        self.assertEqual(main.heating_curve(config), HeatingCurve(47.6, 31.6))
         self.assertEqual(main.off_window(config), OffWindow(23 * 60 + 30, 180))
         # The config keeps the raw values, as the library lists them.
         self.assertEqual(dict(config)["heating_off"], "23:30-03:00")
@@ -745,11 +745,10 @@ class TestConfig(unittest.TestCase):
         for values in ({"history_days": "x"}, {"history_days": "0"}, {"history_days": "nan"},
                        {"max_lead_minutes": "-1"}, {"max_lead_minutes": "1.5"},
                        {"zones": zones_config(setback="warm")}, {"zones": "{"}, {"zones": "[]"},
-                       {"heating_curve": "0.8"}, {"heating_curve_room": "22"},
-                       {"heating_curve": "0", "heating_curve_room": "22"},
-                       {"heating_curve": "-1", "heating_curve_room": "22"},
-                       {"heating_curve": "steep", "heating_curve_room": "22"},
-                       {"heating_curve": "0.8", "heating_curve_room": "nan"},
+                       {"flow_at_minus10": "60"}, {"flow_at_plus10": "35"},
+                       {"flow_at_minus10": "30", "flow_at_plus10": "35"},
+                       {"flow_at_minus10": "hot", "flow_at_plus10": "35"},
+                       {"flow_at_minus10": "60", "flow_at_plus10": "nan"},
                        {"heating_off": "23:30"}, {"heating_off": "25:00-03:00"}, {"heating_off": "03:00-03:00"}):
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):

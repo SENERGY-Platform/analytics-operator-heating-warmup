@@ -8,7 +8,7 @@ One zone as a 1R1C model with a dead time: for `dead_minutes` after the heating 
 
 The time from T0 to T_set at constant T_out is the dead time plus the warm-up with a = a(T_out): the room approaches T_inf = T_out + a/b. If T_inf <= T_set the target is unreachable; otherwise t = ln((T_inf - T0)/(T_inf - T_set))/b, and (T_set - T0)/a for b = 0. A total longer than 6 h counts as unreachable.
 
-With a heating curve the radiator follows the flow temperature VL = R + s (R - T_out) of the boiler: dT/dt = k (VL - T) - c (T - T_out), k > 0, c >= 0, which is the model above with a0 = k R (1 + s), a1 = -k (1 + s), b = k + c.
+With a heating curve the radiator follows the flow temperature VL(T_out) of the boiler, the line through its values at -10 and +10 °C: dT/dt = k (VL - T) - c (T - T_out), k > 0, c >= 0, which is the model above with a(T_out) = k (VL(T_out) - T_out) and b = k + c. Two points fit the curve of any make; a curved one, such as Viessmann's, stays within about 1 K of the line between -10 and +10 °C. A limit of the flow temperature at the boiler belongs into the value at -10 °C.
 
 ## Inputs
 
@@ -32,11 +32,11 @@ The operator declares no selectors and tells the inputs apart by the mapped name
 | `zones` | (required) | JSON list of the zones, see below |
 | `history_days` | 60 | days of history read at each training |
 | `max_lead_minutes` | 240 | upper limit of a lead time |
-| `heating_curve` | empty | slope `s` of the boiler's heating curve, > 0, only together with `heating_curve_room` |
-| `heating_curve_room` | empty | room temperature `R` the heating circuit is set to at the boiler, °C |
+| `flow_at_minus10` | empty | flow temperature of the boiler's heating curve at -10 °C outdoors, °C, only together with `flow_at_plus10` and not below it |
+| `flow_at_plus10` | empty | flow temperature of the heating curve at +10 °C outdoors, °C |
 | `heating_off` | empty | daily switch-off of the heating plant, `HH:MM-HH:MM` Europe/Berlin wall time, may run past midnight (`23:30-03:00`), start and end must differ |
 
-An invalid `heating_curve`, `heating_curve_room` or `heating_off`, or only one of the first two, stops the operator at start.
+An invalid `flow_at_minus10`, `flow_at_plus10` or `heating_off`, or only one of the first two, stops the operator at start.
 
 `zones` lists each zone as `{"key": "zone:0", "name": "Salon", "devices": ["<device id>", ...], "schedule": {...}, "setback": 17}`. `key` must be unique and a device may belong to one zone only. `schedule` is the heating plan of the zone in the format of the heating process, `{"windows":[{"weekdays":[0..6],"from":"hh:mm","to":"hh:mm","temperature":21}]}`, as an object or as JSON text, and `setback` the temperature outside its windows; a zone without both has no plan.
 

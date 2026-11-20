@@ -94,9 +94,9 @@ class CustomConfig(Config):
     zones: str = ""
     history_days: float = 60
     max_lead_minutes: int = 240
-    # Slope and room temperature of the boiler's heating curve, both or neither.
-    heating_curve: float = ""
-    heating_curve_room: float = ""
+    # Flow temperature of the boiler's heating curve at -10 and +10 °C outdoors, both or neither.
+    flow_at_minus10: float = ""
+    flow_at_plus10: float = ""
     # Daily switch-off of the heating plant, "HH:MM-HH:MM" Europe/Berlin, may run past midnight.
     heating_off: str = ""
 
@@ -117,7 +117,7 @@ class CustomConfig(Config):
 
 # Functions rather than methods: the config's base class turns every public class attribute into a config value.
 def heating_curve(config) -> typing.Optional[HeatingCurve]:
-    return parse_heating_curve(config.heating_curve, config.heating_curve_room)
+    return parse_heating_curve(config.flow_at_minus10, config.flow_at_plus10)
 
 
 def off_window(config) -> typing.Optional[OffWindow]:

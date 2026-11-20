@@ -129,11 +129,11 @@
       "type": "int"
     },
     {
-      "name": "heating_curve",
+      "name": "flow_at_minus10",
       "type": "float"
     },
     {
-      "name": "heating_curve_room",
+      "name": "flow_at_plus10",
       "type": "float"
     },
     {

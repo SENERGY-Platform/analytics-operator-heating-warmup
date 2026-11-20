@@ -40,23 +40,28 @@ def off_steps(window: str, first: str, last: str):
 
 class TestHeatingCurve(unittest.TestCase):
     def test_flow_temperature(self):
-        # Read off a boiler: slope 0.8, room 22, 10 °C outside gives 32 °C flow.
-        self.assertAlmostEqual(HeatingCurve(0.8, 22.0).flow(10.0), 31.6)
+        curve = HeatingCurve(60.0, 40.0)
+        self.assertAlmostEqual(curve.flow(-10.0), 60.0)
+        self.assertAlmostEqual(curve.flow(10.0), 40.0)
+        self.assertAlmostEqual(curve.flow(0.0), 50.0)
+        self.assertAlmostEqual(curve.flow(-15.0), 65.0)
+        # A fixed flow temperature is a flat curve.
+        self.assertAlmostEqual(HeatingCurve(45.0, 45.0).flow(5.0), 45.0)
 
     def test_parsing(self):
         self.assertIsNone(parse_heating_curve("", " "))
         self.assertIsNone(parse_heating_curve(None, None))
-        self.assertEqual(parse_heating_curve("0.8", 22), HeatingCurve(0.8, 22.0))
-        self.assertEqual(parse_heating_curve(1.2, "-3"), HeatingCurve(1.2, -3.0))
-        for slope, room in (("0.8", ""), ("", "22")):
-            with self.subTest(slope=slope, room=room):
+        self.assertEqual(parse_heating_curve("75", 50.5), HeatingCurve(75.0, 50.5))
+        self.assertEqual(parse_heating_curve(45, "45"), HeatingCurve(45.0, 45.0))
+        for cold, mild in (("75", ""), ("", "50")):
+            with self.subTest(cold=cold, mild=mild):
                 with self.assertRaisesRegex(ValueError, "together"):
-                    parse_heating_curve(slope, room)
-        for slope, room in (("0", "22"), ("-0.5", "22"), ("x", "22"), ("nan", "22"),
-                            ("inf", "22"), ("0.8", "nan"), (True, "22"), ("0.8", "warm")):
-            with self.subTest(slope=slope, room=room):
+                    parse_heating_curve(cold, mild)
+        for cold, mild in (("40", "50"), ("x", "22"), ("nan", "22"),
+                            ("inf", "22"), ("60", "nan"), (True, "22"), ("60", "warm")):
+            with self.subTest(cold=cold, mild=mild):
                 with self.assertRaises(ValueError):
-                    parse_heating_curve(slope, room)
+                    parse_heating_curve(cold, mild)
 
 
 class TestOffWindowParsing(unittest.TestCase):
