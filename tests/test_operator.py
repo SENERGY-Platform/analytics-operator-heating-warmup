@@ -30,6 +30,7 @@ from operator_lib.util.model import InputTopic
 
 import main
 from main import (HISTORY_RETRIES, HISTORY_RETRY_S, IMPORT_FILTERS, CustomConfig, Operator, applicable_filters)
+from algo.heating import HeatingCurve, OffWindow
 from algo.model import WarmupModel, ZonesModel, warmup_hours
 from algo.training import fit_zones
 from algo.zones import parse_zones
@@ -174,6 +175,19 @@ class TestWarmup(OperatorTestCase):
         result = self.send(self.operator(), at, room_temperature=19.0, target_temperature=21.0)
         self.assertIsNone(result["warmup_minutes"])
 
+    def test_the_output_a_is_the_heating_power_at_the_measured_outdoor_temperature(self):
+        model = WarmupModel(3.0, 0.12, 9, 0.1, a1=-0.1, ta_min=-5.0, ta_max=10.0)
+        at = berlin("2026-01-12T12:00:00")
+        result = self.send(self.operator(), at, model=model, room_temperature=19.0, target_temperature=21.0,
+                           outdoor_temperature=4.04)
+        self.assertEqual(result["a"], 2.6)  # 2.596
+        result = self.send(self.operator(), at, model=model, room_temperature=19.0, target_temperature=21.0,
+                           outdoor_temperature=20.0)
+        self.assertEqual(result["a"], 2.0)
+        # Without a measured outdoor temperature, at 0 °C.
+        result = self.send(self.operator(), at, model=model, room_temperature=19.0, target_temperature=21.0)
+        self.assertEqual(result["a"], 3.0)
+
     def test_unreachable_is_minus_one(self):
         weak = WarmupModel(1.0, 0.15, 9, 0.1)
         result = self.send(self.operator(), berlin("2026-01-12T12:00:00"), model=weak, room_temperature=17.0,
@@ -194,6 +208,93 @@ class TestWarmup(OperatorTestCase):
         result = self.send(op, at + datetime.timedelta(minutes=10), device=None, outdoor_temperature=-999.0)
         self.assertIsNone(result)  # nothing changed
         self.assertEqual(op.outdoor[0], 4.0)
+
+
+DEAD = WarmupModel(4.0, 0.15, 9, 0.1, dead_minutes=30)
+
+
+class TestDeadTime(OperatorTestCase):
+    """warmup_minutes with a model that has a dead time."""
+
+    def minutes_left(self, op, at, **data):
+        self.send(op, at, model=DEAD, **data)
+        return self.current(op, DEAD)["warmup_minutes"]
+
+    def test_the_dead_time_runs_from_the_rise_of_the_setpoint(self):
+        op = self.operator()
+        t0 = berlin("2026-01-12T12:00:00")
+        warmup = warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)
+        self.assertEqual(self.minutes_left(op, t0, room_temperature=19.0, target_temperature=17.0,
+                                           outdoor_temperature=4.0), None)
+        rise = t0 + datetime.timedelta(minutes=1)
+        self.assertEqual(self.minutes_left(op, rise, target_temperature=21.0), minutes(0.5 + warmup))
+        later = rise + datetime.timedelta(minutes=10)
+        self.assertEqual(self.minutes_left(op, later, room_temperature=19.0), minutes(1 / 3 + warmup))
+        later = rise + datetime.timedelta(minutes=45)
+        self.assertEqual(self.minutes_left(op, later, room_temperature=19.0), minutes(warmup))
+        # Another device of the zone reporting the same setpoint is no rise.
+        self.assertEqual(self.minutes_left(op, later, device="d2", target_temperature=21.0), minutes(warmup))
+        # A further rise starts the dead time again.
+        again = later + datetime.timedelta(minutes=5)
+        self.assertEqual(self.minutes_left(op, again, target_temperature=22.0, device="d2"),
+                         minutes(0.5 + warmup_hours(4.0, 0.15, 19.0, 21.5, 4.0)))
+
+    def test_without_a_known_rise_the_whole_dead_time_lies_ahead(self):
+        op = self.operator()
+        at = berlin("2026-01-12T12:00:00")
+        self.assertEqual(self.minutes_left(op, at, room_temperature=19.0, target_temperature=21.0, outdoor_temperature=4.0),
+                         minutes(0.5 + warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)))
+
+    def test_a_lower_setpoint_is_no_rise(self):
+        op = self.operator()
+        t0 = berlin("2026-01-12T12:00:00")
+        self.send(op, t0, model=DEAD, room_temperature=19.0, target_temperature=17.0, outdoor_temperature=4.0)
+        self.send(op, t0 + datetime.timedelta(minutes=1), model=DEAD, target_temperature=22.0)
+        left = self.minutes_left(op, t0 + datetime.timedelta(minutes=50), target_temperature=21.0)
+        self.assertEqual(left, minutes(warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)))
+
+    def test_a_switch_off_in_progress_adds_its_rest_and_holds_the_dead_time(self):
+        # Switched off 23:30-03:00 Berlin, the setpoint rises at 02:00 Berlin, inside it.
+        op = self.operator(heating_off="23:30-03:00")
+        warmup = warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)
+        self.send(op, berlin("2026-01-13T01:55:00"), model=DEAD, room_temperature=19.0, target_temperature=17.0,
+                  outdoor_temperature=4.0)
+        left = self.minutes_left(op, berlin("2026-01-13T02:00:00"), target_temperature=21.0)
+        self.assertEqual(left, minutes(1.0 + 0.5 + warmup))
+        left = self.minutes_left(op, berlin("2026-01-13T02:40:00"), room_temperature=19.0)
+        self.assertEqual(left, minutes(1 / 3 + 0.5 + warmup))
+        # After the switch-off the dead time runs from its end, not from the rise.
+        left = self.minutes_left(op, berlin("2026-01-13T03:10:00"), room_temperature=19.0)
+        self.assertEqual(left, minutes(1 / 3 + warmup))
+
+    def test_a_rise_before_a_switch_off_starts_the_dead_time_again_after_it(self):
+        op = self.operator(heating_off="23:30-03:00")
+        warmup = warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)
+        self.send(op, berlin("2026-01-12T22:50:00"), model=DEAD, room_temperature=19.0, target_temperature=17.0,
+                  outdoor_temperature=4.0)
+        self.assertEqual(self.minutes_left(op, berlin("2026-01-12T23:00:00"), target_temperature=21.0),
+                         minutes(0.5 + warmup))
+        self.assertEqual(self.minutes_left(op, berlin("2026-01-12T23:45:00"), room_temperature=19.0),
+                         minutes(3.25 + 0.5 + warmup))
+        self.assertEqual(self.minutes_left(op, berlin("2026-01-13T03:05:00"), room_temperature=19.0,
+                                           outdoor_temperature=4.0), minutes(25 / 60 + warmup))
+
+    def test_a_rise_after_a_switch_off_counts_from_the_rise(self):
+        op = self.operator(heating_off="23:30-03:00")
+        warmup = warmup_hours(4.0, 0.15, 19.0, 21.0, 4.0)
+        self.send(op, berlin("2026-01-13T05:00:00"), model=DEAD, room_temperature=19.0, target_temperature=17.0,
+                  outdoor_temperature=4.0)
+        left = self.minutes_left(op, berlin("2026-01-13T05:10:00"), target_temperature=21.0)
+        self.assertEqual(left, minutes(0.5 + warmup))
+        left = self.minutes_left(op, berlin("2026-01-13T05:30:00"), room_temperature=19.0)
+        self.assertEqual(left, minutes(1 / 6 + warmup))
+
+    def test_lead_times_take_the_whole_dead_time_and_ignore_the_switch_off(self):
+        op = self.operator(heating_off="23:30-03:00")
+        result = self.send(op, berlin("2026-01-13T01:00:00"), model=DEAD, room_temperature=17.0,
+                           target_temperature=17.0, outdoor_temperature=6.0)
+        self.assertEqual(result["next_start"], "2026-01-13T05:00:00Z")
+        self.assertEqual(result["next_lead_minutes"], minutes(0.5 + warmup_hours(4.0, 0.15, 17.0, 21.0, 6.0)))
 
 
 class TestZones(OperatorTestCase):
@@ -499,7 +600,7 @@ class TestStart(unittest.TestCase):
                                  history=[FakeDataset(thermostat), FakeDataset(weather), UnreadableDataset()])
         self.assertEqual(op.consume, [True, True, False])
         self.assertEqual(len(registry), 1)
-        self.assertAlmostEqual(registry[0].get("z").a, 4.0, delta=0.4)
+        self.assertAlmostEqual(registry[0].get("z").a0, 4.0, delta=0.4)
         self.assertEqual(op.trained_day, datetime.date(2026, 1, 10))
 
 
@@ -519,9 +620,9 @@ class TestRetraining(unittest.TestCase):
         with mock.patch("main.time.monotonic", return_value=monotonic):
             return op.need_retraining(model)
 
-    def operator(self):
+    def operator(self, **config):
         op = Operator()
-        op.config = CustomConfig({"zones": zones_config()})
+        op.config = CustomConfig({"zones": zones_config(), **config})
         op.set_zones(parse_zones(op.config.zones))
         return op
 
@@ -573,13 +674,34 @@ class TestRetraining(unittest.TestCase):
         clock.set_fixed(datetime.datetime(2026, 1, 12, 12, tzinfo=UTC))
         with training_without_ray([FakeDataset(pd.concat([living, bath], ignore_index=True)), FakeDataset(weather)]):
             model = op.train(previous, None)
-        self.assertAlmostEqual(model.get("z").a, 4.0, delta=0.4)
+        self.assertAlmostEqual(model.get("z").a0, 4.0, delta=0.4)
         self.assertIs(model.get("y"), old_y)
         self.assertIsNone(model.get("gone"))
 
         # No zone with a new fit: nothing new to register.
         with training_without_ray([FakeDataset(bath), FakeDataset(weather)]):
             self.assertIsNone(op.train(previous, None))
+
+    def test_the_training_lines_are_warnings(self):
+        op = self.operator()
+        thermostat, weather = simulate(4.0, 0.15, days=5, outdoor=outdoor_by_day)
+        with mock.patch("main.logger") as log:
+            self.train(op, history=[FakeDataset(thermostat), FakeDataset(weather)])
+        lines = [c.args[0] for c in log.warning.call_args_list]
+        self.assertTrue(any(line.startswith("zone z: model: a0=") for line in lines), lines)
+        log.info.assert_not_called()
+
+    def test_heating_curve_and_switch_off_reach_the_training(self):
+        thermostat, weather = simulate(4.0, 0.15, days=5, outdoor=outdoor_by_day)
+        history = [FakeDataset(thermostat), FakeDataset(weather)]
+        op = self.operator(heating_curve="0.8", heating_curve_room="22")
+        model, _ = self.train(op, history=history)
+        self.assertEqual((model.get("z").ta_min, model.get("z").ta_max), (None, None))
+        # The heating comes on at 06:00 UTC, 07:00 in Berlin. Switched off then, no warm-up is usable.
+        op = self.operator(heating_off="06:50-07:20")
+        model, logger = self.train(op, history=history)
+        self.assertIsNone(model)
+        logger.log_metrics.assert_called_once_with({"z.episodes": 0})
 
     def test_a_zone_key_becomes_a_valid_metric_name(self):
         op = Operator()
@@ -594,7 +716,8 @@ class TestRetraining(unittest.TestCase):
         model, logger = self.train(op, history=[FakeDataset(thermostat), FakeDataset(weather)])
         zone = model.get("z")
         logger.log_metrics.assert_called_once_with(
-            {"z.episodes": 5, "z.a": zone.a, "z.b": zone.b, "z.residual": zone.residual})
+            {"z.episodes": 5, "z.a0": zone.a0, "z.a1": zone.a1, "z.b": zone.b, "z.dead_minutes": zone.dead_minutes,
+             "z.residual": zone.residual})
 
         _, logger = self.train(self.operator(), history=[FakeDataset(thermostat.iloc[:300]), FakeDataset(weather)])
         logger.log_metrics.assert_called_once_with({"z.episodes": 1})
@@ -604,6 +727,14 @@ class TestConfig(unittest.TestCase):
     def test_defaults(self):
         config = CustomConfig({})
         self.assertEqual((config.history_days, config.max_lead_minutes, config.zones, config.lat), (60, 240, "", ""))
+        self.assertEqual((main.heating_curve(config), main.off_window(config)), (None, None))
+
+    def test_heating_curve_and_switch_off(self):
+        config = CustomConfig({"heating_curve": "0.8", "heating_curve_room": "22", "heating_off": "23:30-03:00"})
+        self.assertEqual(main.heating_curve(config), HeatingCurve(0.8, 22.0))
+        self.assertEqual(main.off_window(config), OffWindow(23 * 60 + 30, 180))
+        # The config keeps the raw values, as the library lists them.
+        self.assertEqual(dict(config)["heating_off"], "23:30-03:00")
 
     def test_strings_are_parsed(self):
         config = CustomConfig({"history_days": "30", "max_lead_minutes": "120", "history_days ": ""})
@@ -613,7 +744,13 @@ class TestConfig(unittest.TestCase):
     def test_invalid_values_stop_the_start(self):
         for values in ({"history_days": "x"}, {"history_days": "0"}, {"history_days": "nan"},
                        {"max_lead_minutes": "-1"}, {"max_lead_minutes": "1.5"},
-                       {"zones": zones_config(setback="warm")}, {"zones": "{"}, {"zones": "[]"}):
+                       {"zones": zones_config(setback="warm")}, {"zones": "{"}, {"zones": "[]"},
+                       {"heating_curve": "0.8"}, {"heating_curve_room": "22"},
+                       {"heating_curve": "0", "heating_curve_room": "22"},
+                       {"heating_curve": "-1", "heating_curve_room": "22"},
+                       {"heating_curve": "steep", "heating_curve_room": "22"},
+                       {"heating_curve": "0.8", "heating_curve_room": "nan"},
+                       {"heating_off": "23:30"}, {"heating_off": "25:00-03:00"}, {"heating_off": "03:00-03:00"}):
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):
                     CustomConfig(values)

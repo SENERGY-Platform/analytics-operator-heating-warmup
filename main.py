@@ -30,10 +30,12 @@ from operator_lib.util import clock
 from operator_lib.util.helpers import provide_historic_data
 
 from algo.forecast import Forecasts, parse_utc, plain_number
+from algo.heating import HeatingCurve, OffWindow, parse_heating_curve, parse_off_window
 from algo.model import WarmupModel, ZonesModel
 from algo.output import Throttle, iso_utc, round_to, whole_minutes
 from algo.schedule import TIMEZONE
-from algo.training import OUTDOOR, ROOM, SETPOINT, TRAINING_COLUMNS, to_utc_ns, train_zone_models, valid_temperature
+from algo.training import (EPS, OUTDOOR, ROOM, SETPOINT, TRAINING_COLUMNS, to_utc_ns, train_zone_models,
+                           valid_temperature)
 from algo.zones import Zone, parse_zones
 
 FORECAST_TEMPERATURE = "forecast_temperature"
@@ -92,6 +94,11 @@ class CustomConfig(Config):
     zones: str = ""
     history_days: float = 60
     max_lead_minutes: int = 240
+    # Slope and room temperature of the boiler's heating curve, both or neither.
+    heating_curve: float = ""
+    heating_curve_room: float = ""
+    # Daily switch-off of the heating plant, "HH:MM-HH:MM" Europe/Berlin, may run past midnight.
+    heating_off: str = ""
 
     def __init__(self, d, **kwargs):
         super().__init__(d, **kwargs)
@@ -104,6 +111,17 @@ class CustomConfig(Config):
         # Invalid zones stop the operator at start; the library builds an empty config first, so empty passes here.
         if not _blank(self.zones):
             parse_zones(self.zones)
+        heating_curve(self)
+        off_window(self)
+
+
+# Functions rather than methods: the config's base class turns every public class attribute into a config value.
+def heating_curve(config) -> typing.Optional[HeatingCurve]:
+    return parse_heating_curve(config.heating_curve, config.heating_curve_room)
+
+
+def off_window(config) -> typing.Optional[OffWindow]:
+    return parse_off_window(config.heating_off)
 
 
 class OperatorInputs(Inputs):
@@ -219,6 +237,9 @@ class Operator(MLOperator):
         # Per zone key, per device: the latest value and its time.
         self.room: typing.Dict[str, typing.Dict[str, typing.Tuple[float, datetime.datetime]]] = {}
         self.setpoint: typing.Dict[str, typing.Dict[str, typing.Tuple[float, datetime.datetime]]] = {}
+        # Per zone key: the last known live setpoint and when it last rose, which starts the dead time.
+        self.last_setpoint: typing.Dict[str, float] = {}
+        self.setpoint_rise: typing.Dict[str, datetime.datetime] = {}
         self.outdoor: typing.Optional[typing.Tuple[float, datetime.datetime]] = None
         self.forecasts = Forecasts()
         self.now: typing.Optional[datetime.datetime] = None
@@ -242,6 +263,8 @@ class Operator(MLOperator):
         self.zone_of = {d: z.key for z in self.zones for d in z.devices}
         self.room = {z.key: {} for z in self.zones}
         self.setpoint = {z.key: {} for z in self.zones}
+        self.last_setpoint = {}
+        self.setpoint_rise = {}
         self.throttles = {z.key: Throttle(THROTTLE) for z in self.zones}
 
     def init(self, *args, **kwargs):
@@ -276,9 +299,11 @@ class Operator(MLOperator):
             results, notes, history_failed = {}, ["no model: no history"], False
         else:
             results, notes, history_failed = ray.get(train_zone_models.remote(
-                datasets, self.consume, self.devices, {z.key: list(z.devices) for z in self.zones}, to_utc_ns(now)))
+                datasets, self.consume, self.devices, {z.key: list(z.devices) for z in self.zones}, to_utc_ns(now),
+                heating_curve(self.config), off_window(self.config)))
+        # Warning, the default logger_level, so the outcome of each training shows.
         for note in notes:
-            logger.info(note)
+            logger.warning(note)
         # A zone without a new fit keeps its previous model.
         merged, metrics = {}, {}
         for zone in self.zones:
@@ -287,7 +312,8 @@ class Operator(MLOperator):
             metrics[f"{name}.episodes"] = episodes
             if fitted is not None:
                 merged[zone.key] = fitted
-                metrics.update({f"{name}.a": fitted.a, f"{name}.b": fitted.b, f"{name}.residual": fitted.residual})
+                metrics.update({f"{name}.a0": fitted.a0, f"{name}.a1": fitted.a1, f"{name}.b": fitted.b,
+                                f"{name}.dead_minutes": fitted.dead_minutes, f"{name}.residual": fitted.residual})
             elif previous is not None and previous.get(zone.key) is not None:
                 merged[zone.key] = previous.get(zone.key)
         if train_logger is not None:
@@ -367,6 +393,35 @@ class Operator(MLOperator):
             lead = lead_from(room)
         return lead
 
+    def _remaining(self, zone: Zone, model: WarmupModel, room: float, setpoint: float, outdoor: float,
+                   now: datetime.datetime) -> typing.Optional[float]:
+        """
+        Hours of the running warm-up. The dead time runs from the last rise of the setpoint, or from the end of a
+        switch-off after it. Without a known rise it lies wholly ahead. A switch-off in progress adds its rest.
+        """
+        rise = self.setpoint_rise.get(zone.key)
+        off = off_window(self.config)
+        resumes = None if off is None else off.resumes(now)
+        waiting = datetime.timedelta() if resumes is None or resumes <= now else resumes - now
+        elapsed = 0.0
+        if rise is not None:
+            since = rise if resumes is None else max(rise, resumes)
+            elapsed = max(0.0, (now - since) / datetime.timedelta(hours=1))
+        hours = model.hours(room, setpoint, outdoor, elapsed)
+        return None if hours is None else hours + waiting / datetime.timedelta(hours=1)
+
+    def _track_setpoint(self, zone: Zone, at: datetime.datetime, own: bool):
+        """Notes a rise of the zone's live setpoint, at the message's time when the message set it, else at now."""
+        setpoint = self._live_mean(self.setpoint[zone.key], self.now)
+        if setpoint is None:
+            return
+        last = self.last_setpoint.get(zone.key)
+        if last is not None and setpoint > last + EPS:
+            when = at if own else self.now
+            previous = self.setpoint_rise.get(zone.key)
+            self.setpoint_rise[zone.key] = when if previous is None else max(previous, when)
+        self.last_setpoint[zone.key] = setpoint
+
     def _station(self, key: str) -> typing.Optional[str]:
         station = self.stations.get(key)
         if station is None:
@@ -386,7 +441,7 @@ class Operator(MLOperator):
 
         warmup = None
         if model is not None and room is not None and setpoint is not None and setpoint > room and measured is not None:
-            hours = model.hours(room, setpoint, measured)
+            hours = self._remaining(zone, model, room, setpoint, measured, now)
             warmup = -1 if hours is None else whole_minutes(hours)
 
         next_start = next_target = next_lead = None
@@ -408,7 +463,7 @@ class Operator(MLOperator):
         return {
             "zone": zone.key,
             "zone_name": zone.name,
-            "a": None if model is None else round_to(model.a, "0.01"),
+            "a": None if model is None else round_to(model.rate(0.0 if measured is None else measured), "0.01"),
             "b": None if model is None else round_to(model.b, "0.001"),
             "episodes": None if model is None else model.episodes,
             "warmup_minutes": warmup,
@@ -426,8 +481,10 @@ class Operator(MLOperator):
         self.now = at if self.now is None or at > self.now else self.now
         self._update(data, device_id, at)
         models = _unwrap(model)
+        own_zone = self.zone_of.get(str(device_id).strip()) if device_id is not None and SETPOINT in data else None
         results = []
         for zone in self.zones:
+            self._track_setpoint(zone, at, zone.key == own_zone)
             payload = self._payload(zone, None if models is None else models.get(zone.key), self.now)
             passed = self.throttles[zone.key](payload, self.now)
             if passed is not None:

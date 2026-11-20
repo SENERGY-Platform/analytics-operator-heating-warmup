@@ -4,9 +4,11 @@ Learns how fast each heating zone of a home warms up and tells how long before a
 
 ## Model
 
-One zone as a 1R1C model: dT/dt = a - b (T - T_out), with `a` in K/h (heating power over heat capacity) and `b` in 1/h (1/tau).
+One zone as a 1R1C model with a dead time: for `dead_minutes` after the heating is asked for the room does not warm (valve opens, radiator heats up), then dT/dt = a(T_out) - b (T - T_out), with a(T_out) = a0 + a1 T_out in K/h (heating power over heat capacity, higher when it is cold outside with a weather-compensated boiler) and `b` >= 0 in 1/h (1/tau). Without a heating curve, an outdoor temperature beyond the range of the training counts as the nearest end of that range, for a(T_out) and the loss alike.
 
-The time from T0 to T_set at constant T_out: the room approaches T_inf = T_out + a/b. If T_inf <= T_set the target is unreachable; otherwise t = ln((T_inf - T0)/(T_inf - T_set))/b, and (T_set - T0)/a for b = 0. A warm-up longer than 6 h counts as unreachable.
+The time from T0 to T_set at constant T_out is the dead time plus the warm-up with a = a(T_out): the room approaches T_inf = T_out + a/b. If T_inf <= T_set the target is unreachable; otherwise t = ln((T_inf - T0)/(T_inf - T_set))/b, and (T_set - T0)/a for b = 0. A total longer than 6 h counts as unreachable.
+
+With a heating curve the radiator follows the flow temperature VL = R + s (R - T_out) of the boiler: dT/dt = k (VL - T) - c (T - T_out), k > 0, c >= 0, which is the model above with a0 = k R (1 + s), a1 = -k (1 + s), b = k + c.
 
 ## Inputs
 
@@ -30,6 +32,11 @@ The operator declares no selectors and tells the inputs apart by the mapped name
 | `zones` | (required) | JSON list of the zones, see below |
 | `history_days` | 60 | days of history read at each training |
 | `max_lead_minutes` | 240 | upper limit of a lead time |
+| `heating_curve` | empty | slope `s` of the boiler's heating curve, > 0, only together with `heating_curve_room` |
+| `heating_curve_room` | empty | room temperature `R` the heating circuit is set to at the boiler, °C |
+| `heating_off` | empty | daily switch-off of the heating plant, `HH:MM-HH:MM` Europe/Berlin wall time, may run past midnight (`23:30-03:00`), start and end must differ |
+
+An invalid `heating_curve`, `heating_curve_room` or `heating_off`, or only one of the first two, stops the operator at start.
 
 `zones` lists each zone as `{"key": "zone:0", "name": "Salon", "devices": ["<device id>", ...], "schedule": {...}, "setback": 17}`. `key` must be unique and a device may belong to one zone only. `schedule` is the heating plan of the zone in the format of the heating process, `{"windows":[{"weekdays":[0..6],"from":"hh:mm","to":"hh:mm","temperature":21}]}`, as an object or as JSON text, and `setback` the temperature outside its windows; a zone without both has no plan.
 
@@ -40,14 +47,14 @@ The plan follows the heating process: Europe/Berlin wall time, weekday 0 is Mond
 One message per zone, each at most once per 5 minutes and only when one of its values changed after rounding (minutes to whole minutes, temperatures to 0.1 K, `a` to 0.01, `b` to 0.001, half away from zero):
 
 - `zone`, `zone_name`: `key` and `name` of the zone.
-- `a`, `b`, `episodes`: the model of the zone; null without one.
-- `warmup_minutes`: while the setpoint is above the room temperature, the remaining warm-up with the latest measured outdoor temperature; `-1` if unreachable; null otherwise or without model.
+- `a`, `b`, `episodes`: the model of the zone, null without one. `a` is a(T_out) at the latest measured outdoor temperature, at 0 °C without one.
+- `warmup_minutes`: while the setpoint is above the room temperature, the remaining warm-up with the latest measured outdoor temperature; `-1` if unreachable; null otherwise or without model. The dead time runs from the last rise of the zone's setpoint (the mean over its thermostats), or from the end of a `heating_off` window after that rise. While the operator has seen no rise it lies wholly ahead. Inside a `heating_off` window the rest of it is added.
 - `next_start` (ISO UTC), `next_target`: the next plan boundary within 24 h where the plan temperature rises above the current one.
 - `next_lead_minutes`: warm-up time for that boundary; null without model or outdoor temperature.
 - `windows`: JSON text, every rising boundary of the next 24 h as `{"start", "target", "outdoor", "lead_minutes"}`.
 - `measure_station`, `forecast_station`: JSON text `{"id", "name", "distance_km"}` of the station in use. `id` is the station the filter resolved at start; `name` comes from the station's latest message, `distance_km` from its location to `lat`/`long` (0.1 km); each null while unknown. The field is null when the input is no shared import, such as an outdoor device. Both are the same in the message of every zone.
 
-A lead time starts from the plan temperature just before the boundary (the setback unless another window precedes it); if the boundary is closer than that lead, it starts from the current room temperature instead. It uses the MOSMIX forecast at the boundary, from the latest run that has a value for that time (linear between two forecast hours), else the latest measured outdoor temperature. It is capped at `max_lead_minutes`; an unreachable target gives the cap.
+A lead time includes the whole dead time and ignores `heating_off`. It starts from the plan temperature just before the boundary (the setback unless another window precedes it); if the boundary is closer than that lead, it starts from the current room temperature instead. It uses the MOSMIX forecast at the boundary, from the latest run that has a value for that time (linear between two forecast hours), else the latest measured outdoor temperature. It is capped at `max_lead_minutes`; an unreachable target gives the cap.
 
 Room temperature, setpoint and the measured outdoor temperature count for 6 h after their last message. The plan is evaluated at the time of the newest message; a late message does not move it back.
 
@@ -56,10 +63,11 @@ Room temperature, setpoint and the measured outdoor temperature count for 6 h af
 The operator is an `MLOperator` of analytics-operator-lib-python. At start without a model in MLflow, and then once a day (Berlin date), it trains all zones in one Ray task on the cluster (`algo/training.py`), each on `history_days` of its own thermostats and the shared outdoor temperature; the image starts with `uv run`, so Ray builds the environment of `uv.lock` on the workers. The forecast history is not read.
 
 1. Room temperature and outdoor temperature are interpolated onto a 10-minute grid (not across gaps of more than 2 h and 3 h), the setpoint holds its last value for up to 24 h; several devices are averaged.
-2. A warm-up episode starts where the setpoint rises to at least 1 K above the room temperature, and runs until the room reaches the setpoint minus 0.3 K, the setpoint drops, a value is missing, or 6 h pass. An episode needs at least two steps.
-3. `a` and `b` are fitted by least squares on the slope of each step against the mean of T - T_out over it.
+2. A warm-up episode starts where the setpoint rises to at least 1 K above the room temperature, and runs until the room reaches the setpoint minus 0.3 K, the setpoint drops, a value is missing, or 6 h pass. A step whose 10 minutes touch a `heating_off` window, ends included, starts no episode and ends a running one before it. An episode needs at least two steps.
+3. For each dead time of 0 to 60 minutes in steps of 10 the model is fitted by least squares on the slope of each step from that long after the episode start, against the mean temperatures over the step. Without a heating curve a0, a1 and b are fitted, with a1 = 0 if T_out spans less than 3 K over those steps, and refitted with b = 0 if b comes out negative. The fit is dropped if a(T_out) <= 0 at an end of that range. With a heating curve k and c are fitted, refitted with c = 0 if c comes out negative, and the fit is dropped if k <= 0. A fit that does not determine its coefficients is dropped too.
+4. Each remaining fit predicts the duration of every episode, from its first to its last room temperature at its mean T_out (unreachable counts as 6 h). The dead time with the smallest mean absolute error wins, the shorter one on a tie.
 
-Fewer than 3 episodes, a fit with `a` <= 0 or `b` < 0, or no spread in T - T_out give a zone no model; it keeps its previous one and the reason is logged. The models of all zones are registered in MLflow as one model (`ZonesModel`); a training in which no zone got a new fit registers nothing. Per zone, `a`, `b`, the episode count and the RMS residual of the slopes (K/h) are logged to MLflow as `<zone key>.a` and so on, with characters MLflow does not allow in a name replaced by `_`. A history that could not be read, as when the Ray cluster has no CPU free, is read again after 10 minutes, up to six times.
+Fewer than 3 episodes or no dead time with a fit give a zone no model, and it keeps its previous one. One line per zone, logged as a warning, gives a0, a1, b, the dead time, the episodes and the mean error, or the reason. The models of all zones are registered in MLflow as one model (`ZonesModel`); a training in which no zone got a new fit registers nothing. Per zone, `a0`, `a1`, `b`, `dead_minutes`, the RMS residual of the slopes (K/h) and the episode count are logged to MLflow as `<zone key>.a0` and so on, with characters MLflow does not allow in a name replaced by `_`. A history that could not be read, as when the Ray cluster has no CPU free, is read again after 10 minutes, up to six times.
 
 ## Versions
 

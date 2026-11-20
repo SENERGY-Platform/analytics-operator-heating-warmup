@@ -14,14 +14,17 @@
    limitations under the License.
 """
 
+import math
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 
-from algo.model import WarmupModel
-from algo.training import STEP_NS, Grid, build_grid, find_episodes, fit_episodes, fit_zone, fit_zones
-from tests.simulation import START, FakeDataset, UnreadableDataset, simulate
+from algo.heating import HeatingCurve, parse_off_window
+from algo.model import WarmupModel, warmup_hours
+from algo.training import STEP_H, STEP_NS, Grid, build_grid, find_episodes, fit_episodes, fit_zone, fit_zones
+from tests.simulation import START, FakeDataset, UnreadableDataset, simulate, simulate_curve
 
 A, B = 4.0, 0.15
 NOW = int(pd.Timestamp("2026-03-01", tz="UTC").value)
@@ -31,9 +34,9 @@ def outdoor_by_day(day: int) -> float:
     return [-4.0, 8.0, 2.0, 11.0, -1.0, 5.0, 0.0][day % 7]
 
 
-def fit(datasets, consume=None):
+def fit(datasets, consume=None, curve=None, off=None):
     """One zone of every device: (model, notes, history failed, episodes) as fit_zones gives it for that zone."""
-    results, notes, failed = fit_zones(datasets, consume, None, {"z": ["d1", "a", "b"]}, NOW)
+    results, notes, failed = fit_zones(datasets, consume, None, {"z": ["d1", "a", "b"]}, NOW, curve, off)
     if failed:
         return None, notes, True, 0
     model, episodes = results["z"]
@@ -46,11 +49,34 @@ def grid_of(room, setpoint, outdoor) -> Grid:
                 np.array(outdoor, float))
 
 
+def exact_episodes(episodes, a1=0.0) -> Grid:
+    """
+    A grid of warm-ups, each (a0, b, outdoor, start, steps) on the exact curve of dT/dt = a0 + a1 T_out - b (T - T_out),
+    with the setpoint 4 K above the start and one step of setback between them.
+    """
+    room, setpoint, outdoor = [], [], []
+    for a0, b, out, start, steps in episodes:
+        room.append(start)
+        setpoint.append(start)
+        outdoor.append(out)
+        rate = a0 + a1 * out
+        for i in range(steps + 1):
+            t = i * STEP_H
+            room.append(start + rate * t if b == 0 else out + rate / b + (start - out - rate / b) * math.exp(-b * t))
+            setpoint.append(start + 4)
+            outdoor.append(out)
+    return grid_of(room, setpoint, outdoor)
+
+
 class TestFit(unittest.TestCase):
     def assert_recovered(self, model):
         self.assertIsInstance(model, WarmupModel)
-        self.assertLess(abs(model.a - A) / A, 0.10, model.a)
+        self.assertLess(abs(model.a0 - A) / A, 0.10, model.a0)
+        # A heating power that does not depend on the outdoor temperature, across the range trained on.
+        for outdoor in (model.ta_min, model.ta_max):
+            self.assertLess(abs(model.rate(outdoor) - A) / A, 0.10, (outdoor, model.a1))
         self.assertLess(abs(model.b - B) / B, 0.10, model.b)
+        self.assertEqual(model.dead_minutes, 0)
 
     def test_exact_curves_give_back_a_and_b(self):
         thermostat, weather = simulate(A, B, days=14, outdoor=outdoor_by_day)
@@ -62,8 +88,10 @@ class TestFit(unittest.TestCase):
         self.assertLess(model.residual, 0.05)
         # Pairing each step's slope with its mean temperature difference, not the one at its start, is what
         # makes exact curves come back this closely (about 1 % off otherwise).
-        self.assertLess(abs(model.a - A) / A, 0.002)
+        self.assertLess(abs(model.a0 - A) / A, 0.002)
+        self.assertLess(abs(model.a1), 0.0005)
         self.assertLess(abs(model.b - B) / B, 0.002)
+        self.assertEqual((model.ta_min, model.ta_max), (-4.0, 11.0))
 
     def test_rounded_noisy_readings_every_ten_minutes(self):
         thermostat, weather = simulate(A, B, days=21, outdoor=outdoor_by_day, report_minutes=10, decimals=1)
@@ -73,7 +101,7 @@ class TestFit(unittest.TestCase):
     def test_another_zone(self):
         thermostat, weather = simulate(2.5, 0.08, days=14, outdoor=lambda d: [3.0, -6.0, 9.0][d % 3])
         model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
-        self.assertLess(abs(model.a - 2.5) / 2.5, 0.10)
+        self.assertLess(abs(model.a0 - 2.5) / 2.5, 0.10)
         self.assertLess(abs(model.b - 0.08) / 0.08, 0.10)
 
     def test_several_thermostats_are_averaged(self):
@@ -83,8 +111,13 @@ class TestFit(unittest.TestCase):
                                   room_temperature=thermostat["room_temperature"] + 0.5)
         both = pd.concat([thermostat.assign(device_id="a"), other.assign(device_id="b")], ignore_index=True)
         model, _, _, episodes = fit([FakeDataset(both), FakeDataset(weather)])
-        self.assert_recovered(model)
         self.assertEqual(episodes, 10)
+        # The first step of each warm-up averages in a device that has not seen the rise yet. With a1 free that
+        # tilts b (13 % off here), so the check is on what the model is for, the warm-up time.
+        for outdoor in (0.0, 5.0, 11.0):
+            self.assertLess(abs(model.hours(17.25, 21.0, outdoor) / warmup_hours(A, B, 17.25, 21.0, outdoor) - 1), 0.03)
+        for outdoor in (model.ta_min, model.ta_max):
+            self.assertLess(abs(model.rate(outdoor) - A) / A, 0.10)
 
     def test_missing_outdoor_values_of_dwd_are_ignored(self):
         thermostat, weather = simulate(A, B, days=10, outdoor=outdoor_by_day)
@@ -140,6 +173,124 @@ class TestFit(unittest.TestCase):
         self.assertIsNotNone(model)
 
 
+class TestDeadTimeAndHeatingPower(unittest.TestCase):
+    CURVE = HeatingCurve(0.8, 22.0)
+
+    def test_the_heating_curve_gives_back_k_c_and_the_dead_time(self):
+        k, c = 0.12, 0.06
+        thermostat, weather = simulate_curve(k, c, 0.8, 22.0, days=14, outdoor=outdoor_by_day, dead_minutes=30)
+        model, notes, _, episodes = fit([FakeDataset(thermostat), FakeDataset(weather)], curve=self.CURVE)
+        self.assertEqual((model.dead_minutes, episodes), (30, 14))
+        # a1 = -k (1 + s), b = k + c
+        self.assertAlmostEqual(-model.a1 / 1.8, k, delta=k * 0.01)
+        self.assertAlmostEqual(model.b + model.a1 / 1.8, c, delta=c * 0.01)
+        self.assertAlmostEqual(model.a0, k * 22.0 * 1.8, delta=0.01)
+        self.assertEqual((model.ta_min, model.ta_max), (None, None))
+        self.assertTrue(any("dead time 30 min" in n and "a0=" in n and "warm-up error" in n for n in notes), notes)
+
+        grid = build_grid([thermostat, weather])
+        found, _ = fit_episodes(grid, find_episodes(grid), 3, self.CURVE)
+        self.assertAlmostEqual(found.k, k, delta=k * 0.01)
+        self.assertAlmostEqual(found.c, c, delta=c * 0.01)
+
+    def test_without_curve_the_heating_power_follows_the_outdoor_temperature(self):
+        thermostat, weather = simulate(3.0, 0.12, days=14, outdoor=outdoor_by_day, a1=-0.1, dead_minutes=40)
+        model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
+        self.assertEqual(model.dead_minutes, 40)
+        self.assertAlmostEqual(model.a0, 3.0, delta=0.01)
+        self.assertAlmostEqual(model.a1, -0.1, delta=0.001)
+        self.assertAlmostEqual(model.b, 0.12, delta=0.001)
+        self.assertEqual((model.ta_min, model.ta_max), (-4.0, 11.0))
+
+    def test_a_dead_time_too_short_or_too_long_loses(self):
+        thermostat, weather = simulate(A, B, days=10, outdoor=outdoor_by_day, dead_minutes=20)
+        model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
+        self.assertEqual(model.dead_minutes, 20)
+
+    def test_on_a_tie_the_shorter_dead_time_wins(self):
+        thermostat, weather = simulate(A, B, days=10, outdoor=outdoor_by_day, dead_minutes=20)
+        with mock.patch("algo.training.warmup_error", return_value=0.25):
+            model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
+        self.assertEqual(model.dead_minutes, 0)
+        # Float noise below the tie tolerance does not make a longer one win either.
+        errors = iter([0.25, 0.25 - 1e-12, 0.25 - 2e-12, 0.25, 0.25, 0.25, 0.25])
+        with mock.patch("algo.training.warmup_error", side_effect=lambda *_: next(errors)):
+            model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
+        self.assertEqual(model.dead_minutes, 0)
+
+    def test_a_negative_b_is_fitted_again_with_b_zero(self):
+        # Accelerating warm-ups: the slope grows with T - T_out, which reads as b < 0.
+        g = grid_of(room=[17, 17, 17.1, 17.3, 17.6, 18.0, 18.5], setpoint=[17] + [21] * 6, outdoor=[0] * 7)
+        found, _ = fit_episodes(g, [(1, 6)])
+        self.assertEqual((found.b, found.a1), (0.0, 0.0))
+        self.assertAlmostEqual(found.a0, 1.8)  # mean slope of 0.6, 1.2, 1.8, 2.4, 3.0 K/h
+
+    def test_a_negative_c_is_fitted_again_with_c_zero(self):
+        # Exact curves of k (flow - T) - c (T - T_out) with k = 0.2, c = -0.05, as a0 + a1 T_out - b (T - T_out).
+        k, c, s, r = 0.2, -0.05, 0.8, 22.0
+        g = exact_episodes([(k * r * (1 + s), k + c, out, 17.0, 6) for out in (-2.0, 4.0, 9.0)], a1=-k * (1 + s))
+        episodes = find_episodes(g)
+        self.assertEqual(len(episodes), 3)
+        found, _ = fit_episodes(g, episodes, 0, HeatingCurve(s, r))
+        self.assertEqual(found.c, 0.0)
+        # k alone by least squares, and the model it converts to.
+        index = np.array([i for first, last in episodes for i in range(first, last)])
+        y = (g.room[index + 1] - g.room[index]) / STEP_H
+        room = (g.room[index] + g.room[index + 1]) / 2
+        heat = r + s * (r - g.outdoor[index]) - room
+        self.assertAlmostEqual(found.k, float(heat @ y / (heat @ heat)), places=12)
+        self.assertEqual((found.a1, found.b), (-found.k * (1 + s), found.k))
+
+    def test_a1_is_zero_below_three_kelvin_of_outdoor_spread(self):
+        for days, a1 in (((2.0, 4.9), 0.0), ((2.0, 5.0), None)):
+            with self.subTest(days=days):
+                thermostat, weather = simulate(3.0, 0.12, days=10, outdoor=lambda d: days[d % 2], a1=-0.1)
+                model, _, _, _ = fit([FakeDataset(thermostat), FakeDataset(weather)])
+                self.assertEqual((model.ta_min, model.ta_max), days)
+                if a1 is not None:
+                    self.assertEqual(model.a1, a1)
+                else:
+                    self.assertAlmostEqual(model.a1, -0.1, delta=0.001)
+
+    def test_a_rate_at_or_below_zero_within_the_training_range_is_no_fit(self):
+        # Exact warm-ups of a0 = 2, a1 = -0.25: the heating power is gone at 8 °C.
+        g = exact_episodes([(2.0, 0.05, out, 17.0, 6) for out in (-2.0, 3.0, 7.0)], a1=-0.25)
+        found, _ = fit_episodes(g, find_episodes(g))
+        self.assertAlmostEqual(found.a1, -0.25, delta=1e-3)
+        g = exact_episodes([(2.0, 0.05, out, 17.0, 6) for out in (-2.0, 3.0, 9.0)], a1=-0.25)
+        found, reason = fit_episodes(g, find_episodes(g))
+        self.assertIsNone(found)
+        self.assertIn("rejected, rate", reason)
+        self.assertIn("9.0 °C", reason)
+
+    def test_no_dead_time_with_a_fit_gives_no_model(self):
+        thermostat, weather = simulate(A, B, days=5, outdoor=outdoor_by_day)
+        # Room equal to outdoor: no spread in T - T_out for any dead time.
+        weather = thermostat[["time", "room_temperature"]].rename(columns={"room_temperature": "outdoor_temperature"})
+        model, notes, _, episodes = fit([FakeDataset(thermostat), FakeDataset(weather)])
+        self.assertIsNone(model)
+        self.assertEqual(episodes, 5)
+        self.assertTrue(any("no dead time gives a fit from 5 episodes" in n and "60 min:" in n for n in notes), notes)
+
+
+class TestSwitchOff(unittest.TestCase):
+    def test_a_switch_off_over_every_warm_up_leaves_no_episode(self):
+        # The heating comes on at 06:00 UTC, 07:00 in Berlin in January.
+        thermostat, weather = simulate(A, B, days=5, outdoor=outdoor_by_day)
+        model, _, _, episodes = fit([FakeDataset(thermostat), FakeDataset(weather)], off=parse_off_window("06:50-07:20"))
+        self.assertEqual((model, episodes), (None, 0))
+        model, _, _, episodes = fit([FakeDataset(thermostat), FakeDataset(weather)], off=parse_off_window("23:30-03:00"))
+        self.assertEqual(episodes, 5)
+
+    def test_a_switch_off_cuts_the_warm_ups(self):
+        thermostat, weather = simulate(A, B, days=5, outdoor=outdoor_by_day)
+        grid = build_grid([thermostat, weather])
+        whole = find_episodes(grid)
+        # 07:30 Berlin is 06:30 UTC, three steps after the start. The step from 06:20 touches it.
+        cut = find_episodes(grid, parse_off_window("07:30-08:00").steps(grid.times, STEP_NS))
+        self.assertEqual([(first, first + 2) for first, _ in whole], cut)
+
+
 class TestZones(unittest.TestCase):
     """One training for all zones, each from the thermostats listed for it."""
 
@@ -152,9 +303,9 @@ class TestZones(unittest.TestCase):
         self.assertFalse(failed)
         (first, n0), (second, n1) = results["zone:0"], results["zone:1"]
         self.assertEqual((n0, n1), (10, 10))
-        self.assertLess(abs(first.a - A) / A, 0.10)
+        self.assertLess(abs(first.a0 - A) / A, 0.10)
         self.assertLess(abs(first.b - B) / B, 0.10)
-        self.assertLess(abs(second.a - 2.5) / 2.5, 0.10)
+        self.assertLess(abs(second.a0 - 2.5) / 2.5, 0.10)
         self.assertLess(abs(second.b - 0.08) / 0.08, 0.10)
 
     def test_a_device_in_no_zone_is_left_out(self):
@@ -164,7 +315,7 @@ class TestZones(unittest.TestCase):
         results, _, _ = fit_zones([FakeDataset(pd.concat([living, stray], ignore_index=True)), FakeDataset(weather)],
                                   None, None, {"zone:0": ["t1"]}, NOW)
         model, _ = results["zone:0"]
-        self.assertLess(abs(model.a - A) / A, 0.01)
+        self.assertLess(abs(model.a0 - A) / A, 0.01)
 
     def test_too_few_episodes_concern_only_their_zone(self):
         living, weather = simulate(A, B, days=10, outdoor=outdoor_by_day, device="t1")
@@ -222,7 +373,27 @@ class TestEpisodes(unittest.TestCase):
 
     def test_fit_needs_spread_in_the_temperature_difference(self):
         g = grid_of(room=[17, 17, 17.5, 18], setpoint=[17, 21, 21, 21], outdoor=[17, 17, 17.5, 18])
-        self.assertIsNone(fit_episodes(g, [(1, 3)]))
+        fit, reason = fit_episodes(g, [(1, 3)])
+        self.assertIsNone(fit)
+        self.assertIn("not determined", reason)
+
+    def test_a_switch_off_ends_the_episode_before_it(self):
+        g = grid_of(room=[17, 17, 17.5, 18, 18.5, 19, 19.5], setpoint=[17] + [21] * 6, outdoor=[0] * 7)
+        self.assertEqual(find_episodes(g), [(1, 6)])
+        # The step from 3 to 4 touches the switch-off: the episode ends at 3.
+        off = np.zeros(7, dtype=bool)
+        off[3] = True
+        self.assertEqual(find_episodes(g, off), [(1, 3)])
+
+    def test_no_episode_starts_at_a_switched_off_step(self):
+        g = grid_of(room=[17, 17, 17.5, 18, 18.5], setpoint=[17, 21, 21, 21, 21], outdoor=[0] * 5)
+        off = np.zeros(5, dtype=bool)
+        off[1] = True
+        self.assertEqual(find_episodes(g, off), [])
+        # The step before the rise does not matter.
+        off = np.zeros(5, dtype=bool)
+        off[0] = True
+        self.assertEqual(find_episodes(g, off), [(1, 4)])
 
 
 class TestGrid(unittest.TestCase):

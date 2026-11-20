@@ -127,6 +127,18 @@
     {
       "name": "max_lead_minutes",
       "type": "int"
+    },
+    {
+      "name": "heating_curve",
+      "type": "float"
+    },
+    {
+      "name": "heating_curve_room",
+      "type": "float"
+    },
+    {
+      "name": "heating_off",
+      "type": "string"
     }
   ]
 }

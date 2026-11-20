@@ -40,35 +40,64 @@ class UnreadableDataset:
 
 def simulate(a: float, b: float, days: int, outdoor: typing.Callable[[int], float], comfort=21.0, setback=17.0,
              on_minute=6 * 60, off_minute=22 * 60, report_minutes=5, decimals: typing.Optional[int] = None,
-             seed=1, device="d1"):
+             seed=1, device="d1", a1=0.0, dead_minutes=0):
     """
-    A zone heated by a thermostat that holds its setpoint: dT/dt = a - b (T - T_out) while it is below, -b (T - T_out)
-    otherwise, integrated exactly minute by minute. The setpoint is `comfort` from on_minute to off_minute (UTC), else
-    `setback`. Returns the thermostat frame (room and setpoint every `report_minutes`, as the history of an input with
-    several devices, with device_id) and the outdoor frame (every 10 minutes); `outdoor(day)` is the outdoor
-    temperature of a day.
+    A zone heated by a thermostat that holds its setpoint: dT/dt = a + a1 T_out - b (T - T_out) while it is below,
+    -b (T - T_out) otherwise, integrated exactly minute by minute. For `dead_minutes` after the setpoint rises the
+    room stays where it is. The setpoint is `comfort` from on_minute to off_minute (UTC), else `setback`. Returns the
+    thermostat frame (room and setpoint every `report_minutes`, as the history of an input with several devices,
+    with device_id) and the outdoor frame (every 10 minutes); `outdoor(day)` is the outdoor temperature of a day.
     """
+    return _run(heating=lambda out: (out + (a + a1 * out) / b, b), cooling=lambda out: (out, b), days=days,
+                outdoor=outdoor, comfort=comfort, setback=setback, on_minute=on_minute, off_minute=off_minute,
+                report_minutes=report_minutes, decimals=decimals, seed=seed, device=device, dead_minutes=dead_minutes)
+
+
+def simulate_curve(k: float, c: float, slope: float, room: float, days: int, outdoor: typing.Callable[[int], float],
+                   dead_minutes=0, **kwargs):
+    """
+    As simulate(), with a radiator fed along the heating curve: dT/dt = k (flow - T) - c (T - T_out) while heating,
+    flow = room + slope (room - T_out), and -c (T - T_out) with the valve closed.
+    """
+    def heating(out):
+        flow = room + slope * (room - out)
+        return (k * flow + c * out) / (k + c), k + c
+
+    return _run(heating=heating, cooling=lambda out: (out, c), days=days, outdoor=outdoor, dead_minutes=dead_minutes,
+                **kwargs)
+
+
+def _run(heating, cooling, days, outdoor, comfort=21.0, setback=17.0, on_minute=6 * 60, off_minute=22 * 60,
+         report_minutes=5, decimals=None, seed=1, device="d1", dead_minutes=0):
+    # heating(out) and cooling(out) give the temperature the room tends to and the rate it does so, 1/h.
     rng = random.Random(seed)
     T = setback
     rows, outdoor_rows = [], []
+    risen = None  # minute of the last rise of the setpoint
+    previous = None
+    dt = 1 / 60
     for minute in range(days * 1440):
         day, of_day = divmod(minute, 1440)
         out = outdoor(day)
         setpoint = comfort if on_minute <= of_day < off_minute else setback
+        if previous is not None and setpoint > previous:
+            risen = minute
+        previous = setpoint
         at = START + pd.Timedelta(minutes=minute)
         if minute % report_minutes == 0:
             value = T if decimals is None else round(T + rng.uniform(-0.05, 0.05), decimals)
             rows.append((at, value, setpoint))
         if minute % 10 == 0:
             outdoor_rows.append((at, out))
-        dt = 1 / 60
         if T < setpoint:
-            t_inf = out + a / b
-            T_next = t_inf + (T - t_inf) * math.exp(-b * dt)
-            T = min(T_next, setpoint)
+            if risen is not None and minute - risen < dead_minutes:
+                continue
+            t_inf, rate = heating(out)
+            T = min(t_inf + (T - t_inf) * math.exp(-rate * dt), setpoint)
         else:
             # Cooling towards outdoor until the thermostat holds the setpoint.
-            T = max(out + (T - out) * math.exp(-b * dt), setpoint)
+            t_inf, rate = cooling(out)
+            T = max(t_inf + (T - t_inf) * math.exp(-rate * dt), setpoint)
     thermostat = pd.DataFrame(rows, columns=["time", "room_temperature", "target_temperature"]).assign(device_id=device)
     weather = pd.DataFrame(outdoor_rows, columns=["time", "outdoor_temperature"])
     return thermostat, weather
